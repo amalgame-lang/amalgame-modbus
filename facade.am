@@ -1,0 +1,896 @@
+// facade.am — public AM API for the amalgame-modbus package.
+//
+// Modbus TCP client (function codes 01 02 03 04 05 06 15 16) and a
+// Modbus TCP server meant as a PLC simulator for tests and demos.
+// Linux, macOS / BSD and Windows (MinGW-w64).
+//
+// Client :
+//
+//   let h: int = Modbus.Connect("192.168.1.10", 502, 1000)   // timeout ms
+//   let n: int = Modbus.ReadHolding(h, 1, 0, 10)             // unit, addr, count
+//   if (n < 0) { Console.WriteLine(Modbus.LastError(h)) }
+//   let v: int     = Modbus.Value(h, 0)                      // uint16 of the last read
+//   let f: float   = Modbus.Float32(h, 2, false)            // registers 2-3, high word first
+//   Modbus.WriteRegister(h, 1, 100, 42)
+//   Modbus.Close(h)
+//
+// A handle reconnects by itself on the next call after an I/O error.
+// A handle is not meant to be shared between threads : the values of
+// the last read live in the handle. Use one handle per thread.
+//
+// Simulator (one per process) :
+//
+//   Modbus.ServerStart("127.0.0.1", 1502)
+//   Modbus.ServerSetHolding(0, 1234)
+//   Modbus.ServerSetFloat32(3, 10, 21.5, false)   // table 3 = holding, 4 = input
+//   let w: int = Modbus.ServerGetHolding(100)     // what a client wrote
+//
+// Return codes of the read / write calls : >= 0 ok (count read, or 1),
+// -1 I/O error or timeout (the connection is dropped), -2 Modbus
+// exception from the device, -3 malformed response, -4 bad argument.
+
+namespace Amalgame.Modbus
+
+import Amalgame.String
+
+@c {
+    #include <stdio.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <errno.h>
+    #include <pthread.h>
+    #include <time.h>
+
+    /* === Portability layer ======================================
+     * Same shape as amalgame-pollen : every OS-specific call goes
+     * through a _mb_* helper. On Windows, Winsock is resolved at
+     * runtime from ws2_32.dll (amc's [stdlib].libs has no per-OS
+     * form), so the manifest's libs stay the same on every OS. */
+    #ifdef _WIN32
+    #  ifndef _WIN32_WINNT
+    #    define _WIN32_WINNT 0x0600
+    #  endif
+    #  include <winsock2.h>
+    #  include <ws2tcpip.h>
+    #  include <windows.h>
+    static struct {
+        int    (WSAAPI *WSAStartup)(WORD, LPWSADATA);
+        int    (WSAAPI *WSAGetLastError)(void);
+        SOCKET (WSAAPI *socket)(int, int, int);
+        int    (WSAAPI *closesocket)(SOCKET);
+        int    (WSAAPI *setsockopt)(SOCKET, int, int, const char*, int);
+        int    (WSAAPI *getsockopt)(SOCKET, int, int, char*, int*);
+        int    (WSAAPI *bind)(SOCKET, const struct sockaddr*, int);
+        int    (WSAAPI *listen)(SOCKET, int);
+        SOCKET (WSAAPI *accept)(SOCKET, struct sockaddr*, int*);
+        int    (WSAAPI *connect)(SOCKET, const struct sockaddr*, int);
+        int    (WSAAPI *send)(SOCKET, const char*, int, int);
+        int    (WSAAPI *recv)(SOCKET, char*, int, int);
+        int    (WSAAPI *inet_pton)(int, const char*, void*);
+        int    (WSAAPI *WSAPoll)(LPWSAPOLLFD, ULONG, INT);
+        int    (WSAAPI *ioctlsocket)(SOCKET, long, u_long*);
+    } _mb_ws;
+    static void _mb_net_init(void) {
+        static volatile LONG done = 0;
+        if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+        HMODULE m = LoadLibraryA("ws2_32.dll");
+        if (!m) return;
+        #define _MB_WS(name) *(FARPROC*) &_mb_ws.name = GetProcAddress(m, #name)
+        _MB_WS(WSAStartup); _MB_WS(WSAGetLastError); _MB_WS(socket);
+        _MB_WS(closesocket); _MB_WS(setsockopt); _MB_WS(getsockopt);
+        _MB_WS(bind); _MB_WS(listen); _MB_WS(accept); _MB_WS(connect);
+        _MB_WS(send); _MB_WS(recv); _MB_WS(inet_pton); _MB_WS(WSAPoll);
+        _MB_WS(ioctlsocket);
+        #undef _MB_WS
+        WSADATA wsa;
+        if (_mb_ws.WSAStartup) _mb_ws.WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    static uint16_t _mb_htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
+    static int _mb_socket(void) {
+        _mb_net_init();
+        SOCKET s = _mb_ws.socket(AF_INET, SOCK_STREAM, 0);
+        return s == INVALID_SOCKET ? -1 : (int) s;
+    }
+    static void _mb_close(int fd)    { _mb_ws.closesocket((SOCKET) fd); }
+    static int  _mb_send(int fd, const uint8_t* b, int n) { return _mb_ws.send((SOCKET) fd, (const char*) b, n, 0); }
+    static int  _mb_recv(int fd, uint8_t* b, int n) { return _mb_ws.recv((SOCKET) fd, (char*) b, n, 0); }
+    static int  _mb_poll(int fd, int out, int ms) {
+        WSAPOLLFD p; p.fd = (SOCKET) fd; p.events = out ? POLLWRNORM : POLLRDNORM; p.revents = 0;
+        int r = _mb_ws.WSAPoll(&p, 1, ms);
+        if (r > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL)) && out) return -1;
+        return r;
+    }
+    static void _mb_nonblock(int fd, int on) { u_long v = on ? 1 : 0; _mb_ws.ioctlsocket((SOCKET) fd, FIONBIO, &v); }
+    static int  _mb_sock_error(int fd) {
+        int e = 0; int len = sizeof(e);
+        if (_mb_ws.getsockopt((SOCKET) fd, SOL_SOCKET, SO_ERROR, (char*) &e, &len) != 0) return -1;
+        return e;
+    }
+    /* Called before any socket exists (address checks) : load Winsock first. */
+    static int  _mb_inet_pton(const char* h, void* dst) {
+        _mb_net_init();
+        return _mb_ws.inet_pton ? _mb_ws.inet_pton(AF_INET, h, dst) : 0;
+    }
+    static int  _mb_bind_listen(int fd, struct sockaddr_in* a) {
+        int one = 1;
+        _mb_ws.setsockopt((SOCKET) fd, SOL_SOCKET, SO_REUSEADDR, (const char*) &one, sizeof(one));
+        if (_mb_ws.bind((SOCKET) fd, (struct sockaddr*) a, sizeof(*a)) != 0) return -1;
+        return _mb_ws.listen((SOCKET) fd, 16);
+    }
+    static int  _mb_accept(int fd) { SOCKET c = _mb_ws.accept((SOCKET) fd, NULL, NULL); return c == INVALID_SOCKET ? -1 : (int) c; }
+    static int  _mb_connect_raw(int fd, struct sockaddr_in* a) { return _mb_ws.connect((SOCKET) fd, (struct sockaddr*) a, sizeof(*a)); }
+    static void _mb_nodelay(int fd) { int one = 1; _mb_ws.setsockopt((SOCKET) fd, IPPROTO_TCP, TCP_NODELAY, (const char*) &one, sizeof(one)); }
+    static int64_t _mb_now_ms(void) { return (int64_t) GetTickCount64(); }
+    #else
+    #  include <unistd.h>
+    #  include <fcntl.h>
+    #  include <sys/socket.h>
+    #  include <netinet/in.h>
+    #  include <netinet/tcp.h>
+    #  include <arpa/inet.h>
+    #  include <poll.h>
+    #  include <signal.h>
+    #  ifndef MSG_NOSIGNAL
+    #    define MSG_NOSIGNAL 0     /* macOS / BSD : SO_NOSIGPIPE below */
+    #  endif
+    static uint16_t _mb_htons(uint16_t v) { return htons(v); }
+    static int _mb_socket(void) {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+    #  ifdef SO_NOSIGPIPE
+        if (s >= 0) { int one = 1; setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)); }
+    #  endif
+        return s;
+    }
+    static void _mb_close(int fd)    { close(fd); }
+    static int  _mb_send(int fd, const uint8_t* b, int n) { return (int) send(fd, b, (size_t) n, MSG_NOSIGNAL); }
+    static int  _mb_recv(int fd, uint8_t* b, int n) { return (int) recv(fd, b, (size_t) n, 0); }
+    static int  _mb_poll(int fd, int out, int ms) {
+        struct pollfd p; p.fd = fd; p.events = out ? POLLOUT : POLLIN; p.revents = 0;
+        int r = poll(&p, 1, ms);
+        if (r > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL)) && out) return -1;
+        return r;
+    }
+    static void _mb_nonblock(int fd, int on) {
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+    }
+    static int  _mb_sock_error(int fd) {
+        int e = 0; socklen_t len = sizeof(e);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &len) != 0) return -1;
+        return e;
+    }
+    static int  _mb_inet_pton(const char* h, void* dst) { return inet_pton(AF_INET, h, dst); }
+    static int  _mb_bind_listen(int fd, struct sockaddr_in* a) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (bind(fd, (struct sockaddr*) a, sizeof(*a)) != 0) return -1;
+        return listen(fd, 16);
+    }
+    static int  _mb_accept(int fd) { return accept(fd, NULL, NULL); }
+    static int  _mb_connect_raw(int fd, struct sockaddr_in* a) { return connect(fd, (struct sockaddr*) a, sizeof(*a)); }
+    static void _mb_nodelay(int fd) { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
+    static int64_t _mb_now_ms(void) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    }
+    #endif
+    #include <gc.h>
+
+    /* IPv4 literal or "localhost". PLCs are addressed by IP. */
+    static int _mb_addr(const char* host, int port, struct sockaddr_in* a) {
+        memset(a, 0, sizeof(*a));
+        a->sin_family = AF_INET;
+        a->sin_port = _mb_htons((uint16_t) port);
+        if (!host || !host[0] || strcmp(host, "localhost") == 0) host = "127.0.0.1";
+        return _mb_inet_pton(host, &a->sin_addr) == 1;
+    }
+
+    /* Connect with a timeout : non-blocking connect, then wait for
+     * writability. A blocking connect to an unreachable PLC would
+     * stall the poll loop for the OS timeout (~20 s or more). */
+    static int _mb_connect(const char* host, int port, int timeout_ms) {
+        struct sockaddr_in a;
+        if (!_mb_addr(host, port, &a)) return -1;
+        int fd = _mb_socket();
+        if (fd < 0) return -1;
+        _mb_nonblock(fd, 1);
+        if (_mb_connect_raw(fd, &a) != 0) {
+            int r = _mb_poll(fd, 1, timeout_ms);
+            if (r <= 0 || _mb_sock_error(fd) != 0) { _mb_close(fd); return -1; }
+        }
+        _mb_nonblock(fd, 0);
+        _mb_nodelay(fd);
+        return fd;
+    }
+
+    static int _mb_send_all(int fd, const uint8_t* b, int n) {
+        int sent = 0;
+        while (sent < n) {
+            int w = _mb_send(fd, b + sent, n - sent);
+            if (w <= 0) return 0;
+            sent += w;
+        }
+        return 1;
+    }
+
+    /* Read exactly n bytes before `deadline` (monotonic ms).
+     * Returns 1 ok, 0 timeout, -1 connection closed or error. */
+    static int _mb_recv_all(int fd, uint8_t* b, int n, int64_t deadline) {
+        int got = 0;
+        while (got < n) {
+            int left = (int) (deadline - _mb_now_ms());
+            if (left <= 0) return 0;
+            int p = _mb_poll(fd, 0, left);
+            if (p == 0) return 0;
+            if (p < 0) return -1;
+            int r = _mb_recv(fd, b + got, n - got);
+            if (r <= 0) return -1;
+            got += r;
+        }
+        return 1;
+    }
+
+    static uint16_t _mb_get16(const uint8_t* p) { return (uint16_t) ((p[0] << 8) | p[1]); }
+    static void     _mb_put16(uint8_t* p, uint16_t v) { p[0] = (uint8_t) (v >> 8); p[1] = (uint8_t) v; }
+
+    /* === Client ================================================= */
+
+    #define MB_MAX_CONN   64
+    #define MB_MAX_VALUES 2000     /* FC01/02 read up to 2000 bits */
+
+    typedef struct {
+        int             fd;          /* -1 when disconnected */
+        char            host[64];
+        int             port;
+        int             timeout_ms;
+        uint16_t        tid;
+        uint16_t        values[MB_MAX_VALUES];
+        int             nvalues;
+        char            err[160];
+        pthread_mutex_t mu;
+    } mb_conn_t;
+
+    static mb_conn_t*      _mb_conns[MB_MAX_CONN];
+    static pthread_mutex_t _mb_conns_mu = PTHREAD_MUTEX_INITIALIZER;
+
+    static mb_conn_t* _mb_get(int64_t h) {
+        if (h < 0 || h >= MB_MAX_CONN) return 0;
+        return _mb_conns[h];
+    }
+
+    static const char* _mb_exception_text(int code) {
+        switch (code) {
+            case 1:  return "illegal function";
+            case 2:  return "illegal data address";
+            case 3:  return "illegal data value";
+            case 4:  return "server device failure";
+            case 5:  return "acknowledge";
+            case 6:  return "server device busy";
+            case 10: return "gateway path unavailable";
+            case 11: return "gateway target device failed to respond";
+            default: return "unknown exception";
+        }
+    }
+
+    /* Caller holds c->mu. */
+    static void _mb_drop(mb_conn_t* c) {
+        if (c->fd >= 0) { _mb_close(c->fd); c->fd = -1; }
+    }
+
+    /* One request / response. `pdu` is function code + data. On
+     * success the response PDU is copied into `resp` (max 260 bytes)
+     * and its length returned. Caller holds c->mu.
+     * Returns >0 ok, -1 I/O or timeout, -2 exception, -3 malformed. */
+    static int _mb_transact_once(mb_conn_t* c, int unit, const uint8_t* pdu, int pdu_len, uint8_t* resp, int* closed);
+
+    /* A reused connection may have been closed by the device since the
+     * last call (PLC restarted) : the first request then fails with
+     * "closed". Retry once on a fresh connection so the call succeeds
+     * as soon as the device is back. */
+    static int _mb_transact(mb_conn_t* c, int unit, const uint8_t* pdu, int pdu_len, uint8_t* resp) {
+        int reused = c->fd >= 0;
+        int closed = 0;
+        int rc = _mb_transact_once(c, unit, pdu, pdu_len, resp, &closed);
+        if (rc == -1 && closed && reused) rc = _mb_transact_once(c, unit, pdu, pdu_len, resp, &closed);
+        return rc;
+    }
+
+    static int _mb_transact_once(mb_conn_t* c, int unit, const uint8_t* pdu, int pdu_len, uint8_t* resp, int* closed) {
+        *closed = 0;
+        if (c->fd < 0) {
+            c->fd = _mb_connect(c->host, c->port, c->timeout_ms);
+            if (c->fd < 0) {
+                snprintf(c->err, sizeof(c->err), "cannot connect to %s:%d", c->host, c->port);
+                return -1;
+            }
+        }
+        uint8_t req[264];
+        uint16_t tid = ++c->tid;
+        _mb_put16(req, tid);
+        _mb_put16(req + 2, 0);                       /* protocol id */
+        _mb_put16(req + 4, (uint16_t) (pdu_len + 1));
+        req[6] = (uint8_t) unit;
+        memcpy(req + 7, pdu, (size_t) pdu_len);
+        if (!_mb_send_all(c->fd, req, 7 + pdu_len)) {
+            _mb_drop(c);
+            *closed = 1;
+            snprintf(c->err, sizeof(c->err), "connection closed by the device");
+            return -1;
+        }
+        int64_t deadline = _mb_now_ms() + c->timeout_ms;
+        for (;;) {
+            uint8_t hdr[7];
+            int r = _mb_recv_all(c->fd, hdr, 7, deadline);
+            if (r <= 0) {
+                _mb_drop(c);
+                *closed = r < 0;
+                if (r < 0) snprintf(c->err, sizeof(c->err), "connection closed by the device");
+                else snprintf(c->err, sizeof(c->err), "no response within %d ms", c->timeout_ms);
+                return -1;
+            }
+            int len = _mb_get16(hdr + 4);
+            if (_mb_get16(hdr + 2) != 0 || len < 2 || len > 254) {
+                _mb_drop(c);
+                snprintf(c->err, sizeof(c->err), "malformed MBAP header");
+                return -3;
+            }
+            if (_mb_recv_all(c->fd, resp, len - 1, deadline) <= 0) {
+                _mb_drop(c);
+                snprintf(c->err, sizeof(c->err), "truncated response");
+                return -1;
+            }
+            /* A late answer to an earlier, timed-out request : skip it. */
+            if (_mb_get16(hdr) != tid) continue;
+            if (resp[0] == (uint8_t) (pdu[0] | 0x80)) {
+                int code = len >= 3 ? resp[1] : 0;
+                snprintf(c->err, sizeof(c->err), "exception %d (%s)", code, _mb_exception_text(code));
+                return -2;
+            }
+            if (resp[0] != pdu[0]) {
+                snprintf(c->err, sizeof(c->err), "function code mismatch");
+                return -3;
+            }
+            return len - 1;
+        }
+    }
+
+    static int64_t _mb_open(const char* host, int64_t port, int64_t timeout_ms) {
+        if (!host || strlen(host) >= 64 || port <= 0 || port > 65535) return -1;
+        struct sockaddr_in probe;
+        if (!_mb_addr(host, (int) port, &probe)) return -1;   /* not IPv4 */
+        mb_conn_t* c = (mb_conn_t*) calloc(1, sizeof(mb_conn_t));
+        if (!c) return -1;
+        strcpy(c->host, host);
+        c->port = (int) port;
+        c->timeout_ms = timeout_ms > 0 ? (int) timeout_ms : 1000;
+        pthread_mutex_init(&c->mu, NULL);
+        c->fd = _mb_connect(c->host, c->port, c->timeout_ms);
+        if (c->fd < 0) snprintf(c->err, sizeof(c->err), "cannot connect to %s:%d", c->host, c->port);
+        pthread_mutex_lock(&_mb_conns_mu);
+        int64_t h = -1;
+        for (int i = 0; i < MB_MAX_CONN; i++) {
+            if (!_mb_conns[i]) { _mb_conns[i] = c; h = i; break; }
+        }
+        pthread_mutex_unlock(&_mb_conns_mu);
+        if (h < 0) { if (c->fd >= 0) _mb_close(c->fd); free(c); }
+        return h;
+    }
+
+    static void _mb_close_handle(int64_t h) {
+        pthread_mutex_lock(&_mb_conns_mu);
+        mb_conn_t* c = _mb_get(h);
+        if (c) _mb_conns[h] = 0;
+        pthread_mutex_unlock(&_mb_conns_mu);
+        if (!c) return;
+        pthread_mutex_lock(&c->mu);
+        _mb_drop(c);
+        pthread_mutex_unlock(&c->mu);
+        pthread_mutex_destroy(&c->mu);
+        free(c);
+    }
+
+    /* FC01 / 02 (bits) and FC03 / 04 (registers). */
+    static int64_t _mb_read(int64_t h, int64_t unit, int fc, int64_t addr, int64_t count) {
+        mb_conn_t* c = _mb_get(h);
+        if (!c) return -4;
+        int max = (fc <= 2) ? 2000 : 125;
+        if (addr < 0 || addr > 65535 || count < 1 || count > max || addr + count > 65536) {
+            snprintf(c->err, sizeof(c->err), "bad address or count");
+            return -4;
+        }
+        uint8_t pdu[5], resp[260];
+        pdu[0] = (uint8_t) fc;
+        _mb_put16(pdu + 1, (uint16_t) addr);
+        _mb_put16(pdu + 3, (uint16_t) count);
+        pthread_mutex_lock(&c->mu);
+        int n = _mb_transact(c, (int) unit, pdu, 5, resp);
+        int64_t rc = n;
+        if (n > 0) {
+            int bytes = resp[1];
+            int need = (fc <= 2) ? (int) ((count + 7) / 8) : (int) count * 2;
+            if (n < 2 + need || bytes != need) {
+                snprintf(c->err, sizeof(c->err), "unexpected byte count");
+                rc = -3;
+            } else {
+                for (int i = 0; i < count; i++) {
+                    c->values[i] = (fc <= 2)
+                        ? (uint16_t) ((resp[2 + i / 8] >> (i % 8)) & 1)
+                        : _mb_get16(resp + 2 + 2 * i);
+                }
+                c->nvalues = (int) count;
+                c->err[0] = 0;
+                rc = count;
+            }
+        }
+        pthread_mutex_unlock(&c->mu);
+        return rc;
+    }
+
+    /* FC05 / 06 : single coil / register. */
+    static int64_t _mb_write_single(int64_t h, int64_t unit, int fc, int64_t addr, int64_t value) {
+        mb_conn_t* c = _mb_get(h);
+        if (!c) return -4;
+        if (addr < 0 || addr > 65535) { snprintf(c->err, sizeof(c->err), "bad address"); return -4; }
+        uint8_t pdu[5], resp[260];
+        pdu[0] = (uint8_t) fc;
+        _mb_put16(pdu + 1, (uint16_t) addr);
+        _mb_put16(pdu + 3, fc == 5 ? (value ? 0xFF00 : 0x0000) : (uint16_t) value);
+        pthread_mutex_lock(&c->mu);
+        int n = _mb_transact(c, (int) unit, pdu, 5, resp);
+        int64_t rc = n;
+        if (n > 0) {
+            if (n < 5 || memcmp(resp, pdu, 5) != 0) { snprintf(c->err, sizeof(c->err), "write not echoed"); rc = -3; }
+            else { c->err[0] = 0; rc = 1; }
+        }
+        pthread_mutex_unlock(&c->mu);
+        return rc;
+    }
+
+    /* FC16 : `count` registers from `regs`. */
+    static int64_t _mb_write_regs(int64_t h, int64_t unit, int64_t addr, const uint16_t* regs, int count) {
+        mb_conn_t* c = _mb_get(h);
+        if (!c) return -4;
+        if (addr < 0 || count < 1 || count > 123 || addr + count > 65536) {
+            snprintf(c->err, sizeof(c->err), "bad address or count");
+            return -4;
+        }
+        uint8_t pdu[6 + 246], resp[260];
+        pdu[0] = 16;
+        _mb_put16(pdu + 1, (uint16_t) addr);
+        _mb_put16(pdu + 3, (uint16_t) count);
+        pdu[5] = (uint8_t) (count * 2);
+        for (int i = 0; i < count; i++) _mb_put16(pdu + 6 + 2 * i, regs[i]);
+        pthread_mutex_lock(&c->mu);
+        int n = _mb_transact(c, (int) unit, pdu, 6 + 2 * count, resp);
+        int64_t rc = n;
+        if (n > 0) {
+            if (n < 5 || memcmp(resp + 1, pdu + 1, 4) != 0) { snprintf(c->err, sizeof(c->err), "write not acknowledged"); rc = -3; }
+            else { c->err[0] = 0; rc = 1; }
+        }
+        pthread_mutex_unlock(&c->mu);
+        return rc;
+    }
+
+    /* "1,2,3" → registers. Returns the count, or -1 on a bad list. */
+    static int _mb_parse_list(const char* s, uint16_t* out, int max) {
+        int n = 0;
+        if (!s) return -1;
+        while (*s) {
+            while (*s == ' ') s++;
+            char* end;
+            long v = strtol(s, &end, 10);
+            if (end == s || v < -32768 || v > 65535 || n >= max) return -1;
+            out[n++] = (uint16_t) v;
+            s = end;
+            while (*s == ' ') s++;
+            if (*s == ',') s++;
+            else if (*s) return -1;
+        }
+        return n;
+    }
+
+    /* 32-bit values over two registers. word_swap = 0 : high word
+     * first (ABCD, the Modbus convention) ; 1 : low word first (CDAB). */
+    static uint32_t _mb_join32(uint16_t a, uint16_t b, int word_swap) {
+        return word_swap ? (((uint32_t) b << 16) | a) : (((uint32_t) a << 16) | b);
+    }
+    static void _mb_split32(uint32_t v, uint16_t* out, int word_swap) {
+        uint16_t hi = (uint16_t) (v >> 16), lo = (uint16_t) v;
+        out[0] = word_swap ? lo : hi;
+        out[1] = word_swap ? hi : lo;
+    }
+    static uint32_t _mb_f2u(double f) { float x = (float) f; uint32_t u; memcpy(&u, &x, 4); return u; }
+    static double   _mb_u2f(uint32_t u) { float x; memcpy(&x, &u, 4); return (double) x; }
+
+    static int64_t _mb_value(int64_t h, int64_t i) {
+        mb_conn_t* c = _mb_get(h);
+        if (!c || i < 0 || i >= c->nvalues) return 0;
+        return c->values[i];
+    }
+    static uint32_t _mb_value32(int64_t h, int64_t i, int word_swap) {
+        mb_conn_t* c = _mb_get(h);
+        if (!c || i < 0 || i + 1 >= c->nvalues) return 0;
+        return _mb_join32(c->values[i], c->values[i + 1], word_swap);
+    }
+
+    static code_string _mb_last_error(int64_t h) {
+        mb_conn_t* c = _mb_get(h);
+        const char* e = c ? c->err : "bad handle";
+        size_t n = strlen(e);
+        char* out = (char*) GC_MALLOC_ATOMIC(n + 1);
+        if (out) memcpy(out, e, n + 1);
+        return (code_string) out;
+    }
+
+    static int64_t _mb_is_connected(int64_t h) {
+        mb_conn_t* c = _mb_get(h);
+        return c && c->fd >= 0;
+    }
+
+    /* === Server (PLC simulator) =================================
+     * One per process. Four 65536-entry tables, any unit id. Server
+     * threads never allocate from the GC, so plain pthreads. */
+
+    static uint8_t         _mbs_coils[65536];
+    static uint8_t         _mbs_discrete[65536];
+    static uint16_t        _mbs_holding[65536];
+    static uint16_t        _mbs_input[65536];
+    static pthread_mutex_t _mbs_mu = PTHREAD_MUTEX_INITIALIZER;
+    static int             _mbs_listen_fd = -1;
+    static volatile long   _mbs_requests = 0;
+    static volatile int    _mbs_size = 65536;       /* addresses >= size → exception 2 */
+
+    /* Build the response PDU for request `q` (length qn) into `r`.
+     * Returns the response PDU length. */
+    static int _mbs_handle(const uint8_t* q, int qn, uint8_t* r) {
+        int fc = q[0];
+        int ex = 0;
+        int rn = 0;
+        pthread_mutex_lock(&_mbs_mu);
+        int size = _mbs_size;
+        if ((fc >= 1 && fc <= 6) && qn < 5) ex = 3;
+        else if (fc == 1 || fc == 2 || fc == 3 || fc == 4) {
+            int addr = _mb_get16(q + 1), cnt = _mb_get16(q + 3);
+            int max = fc <= 2 ? 2000 : 125;
+            if (cnt < 1 || cnt > max) ex = 3;
+            else if (addr + cnt > size) ex = 2;
+            else if (fc <= 2) {
+                const uint8_t* t = fc == 1 ? _mbs_coils : _mbs_discrete;
+                int bytes = (cnt + 7) / 8;
+                r[0] = (uint8_t) fc; r[1] = (uint8_t) bytes;
+                memset(r + 2, 0, (size_t) bytes);
+                for (int i = 0; i < cnt; i++) if (t[addr + i]) r[2 + i / 8] |= (uint8_t) (1 << (i % 8));
+                rn = 2 + bytes;
+            } else {
+                const uint16_t* t = fc == 3 ? _mbs_holding : _mbs_input;
+                r[0] = (uint8_t) fc; r[1] = (uint8_t) (cnt * 2);
+                for (int i = 0; i < cnt; i++) _mb_put16(r + 2 + 2 * i, t[addr + i]);
+                rn = 2 + cnt * 2;
+            }
+        } else if (fc == 5 || fc == 6) {
+            int addr = _mb_get16(q + 1), v = _mb_get16(q + 3);
+            if (addr >= size) ex = 2;
+            else if (fc == 5 && v != 0xFF00 && v != 0) ex = 3;
+            else {
+                if (fc == 5) _mbs_coils[addr] = v ? 1 : 0;
+                else _mbs_holding[addr] = (uint16_t) v;
+                memcpy(r, q, 5); rn = 5;
+            }
+        } else if (fc == 15 || fc == 16) {
+            if (qn < 6) ex = 3;
+            else {
+                int addr = _mb_get16(q + 1), cnt = _mb_get16(q + 3), bytes = q[5];
+                int need = fc == 15 ? (cnt + 7) / 8 : cnt * 2;
+                int max = fc == 15 ? 1968 : 123;
+                if (cnt < 1 || cnt > max || bytes != need || qn < 6 + bytes) ex = 3;
+                else if (addr + cnt > size) ex = 2;
+                else {
+                    for (int i = 0; i < cnt; i++) {
+                        if (fc == 15) _mbs_coils[addr + i] = (q[6 + i / 8] >> (i % 8)) & 1;
+                        else _mbs_holding[addr + i] = _mb_get16(q + 6 + 2 * i);
+                    }
+                    memcpy(r, q, 5); rn = 5;
+                }
+            }
+        } else ex = 1;
+        pthread_mutex_unlock(&_mbs_mu);
+        if (ex) { r[0] = (uint8_t) (fc | 0x80); r[1] = (uint8_t) ex; rn = 2; }
+        return rn;
+    }
+
+    static void* _mbs_conn_thread(void* arg) {
+        int fd = (int) (intptr_t) arg;
+        uint8_t hdr[7], q[256], out[7 + 260];
+        for (;;) {
+            /* Idle clients stay connected : wait without a deadline. */
+            if (_mb_poll(fd, 0, -1) <= 0) break;
+            if (_mb_recv_all(fd, hdr, 7, _mb_now_ms() + 5000) <= 0) break;
+            int len = _mb_get16(hdr + 4);
+            if (_mb_get16(hdr + 2) != 0 || len < 2 || len > 254) break;
+            if (_mb_recv_all(fd, q, len - 1, _mb_now_ms() + 5000) <= 0) break;
+            int rn = _mbs_handle(q, len - 1, out + 7);
+            __sync_fetch_and_add(&_mbs_requests, 1);
+            memcpy(out, hdr, 4);                     /* tid + protocol */
+            _mb_put16(out + 4, (uint16_t) (rn + 1));
+            out[6] = hdr[6];                         /* unit */
+            if (!_mb_send_all(fd, out, 7 + rn)) break;
+        }
+        _mb_close(fd);
+        return NULL;
+    }
+
+    static void* _mbs_accept_thread(void* arg) {
+        (void) arg;
+        for (;;) {
+            int c = _mb_accept(_mbs_listen_fd);
+            if (c < 0) { if (_mbs_listen_fd < 0) break; continue; }
+            _mb_nodelay(c);
+            pthread_t th;
+            if (pthread_create(&th, NULL, _mbs_conn_thread, (void*) (intptr_t) c) != 0) { _mb_close(c); continue; }
+            pthread_detach(th);
+        }
+        return NULL;
+    }
+
+    /* Bind to `host` ("127.0.0.1" keeps it local : no firewall
+     * prompt on Windows ; "0.0.0.0" for every interface). */
+    static int64_t _mbs_start(const char* host, int64_t port) {
+        if (_mbs_listen_fd >= 0) return 0;
+        struct sockaddr_in a;
+        if (!host || !host[0]) host = "127.0.0.1";
+        if (strcmp(host, "0.0.0.0") == 0) {
+            memset(&a, 0, sizeof(a));
+            a.sin_family = AF_INET;
+            a.sin_port = _mb_htons((uint16_t) port);
+        } else if (!_mb_addr(host, (int) port, &a)) return 0;
+        int fd = _mb_socket();
+        if (fd < 0) return 0;
+        if (_mb_bind_listen(fd, &a) != 0) { _mb_close(fd); return 0; }
+        _mbs_listen_fd = fd;
+        pthread_t th;
+        if (pthread_create(&th, NULL, _mbs_accept_thread, NULL) != 0) {
+            _mb_close(fd); _mbs_listen_fd = -1; return 0;
+        }
+        pthread_detach(th);
+        return 1;
+    }
+
+    static void _mbs_set(int table, int64_t addr, int64_t v) {
+        if (addr < 0 || addr > 65535) return;
+        pthread_mutex_lock(&_mbs_mu);
+        switch (table) {
+            case 1: _mbs_coils[addr] = v ? 1 : 0; break;
+            case 2: _mbs_discrete[addr] = v ? 1 : 0; break;
+            case 3: _mbs_holding[addr] = (uint16_t) v; break;
+            case 4: _mbs_input[addr] = (uint16_t) v; break;
+        }
+        pthread_mutex_unlock(&_mbs_mu);
+    }
+
+    static int64_t _mbs_get(int table, int64_t addr) {
+        if (addr < 0 || addr > 65535) return 0;
+        pthread_mutex_lock(&_mbs_mu);
+        int64_t v = 0;
+        switch (table) {
+            case 1: v = _mbs_coils[addr]; break;
+            case 2: v = _mbs_discrete[addr]; break;
+            case 3: v = _mbs_holding[addr]; break;
+            case 4: v = _mbs_input[addr]; break;
+        }
+        pthread_mutex_unlock(&_mbs_mu);
+        return v;
+    }
+
+    static void _mbs_set32(int table, int64_t addr, uint32_t v, int word_swap) {
+        if ((table != 3 && table != 4) || addr < 0 || addr > 65534) return;
+        uint16_t w[2];
+        _mb_split32(v, w, word_swap);
+        pthread_mutex_lock(&_mbs_mu);
+        uint16_t* t = table == 3 ? _mbs_holding : _mbs_input;
+        t[addr] = w[0]; t[addr + 1] = w[1];
+        pthread_mutex_unlock(&_mbs_mu);
+    }
+}
+
+public class Modbus {
+
+    // ── Client ───────────────────────────────────────────────────
+
+    // Open a client handle. Returns the handle (>= 0), or -1 when the
+    // host is not an IPv4 address or 64 handles are open. A device
+    // that does not answer yet still gets a handle : the next call
+    // retries, and IsConnected tells.
+    public static int Connect(host: string, port: int, timeoutMs: int) {
+        var h: int = -1
+        @c { h = _mb_open((const char*) host, port, timeoutMs); }
+        return h
+    }
+
+    public static void Close(h: int) {
+        @c { _mb_close_handle(h); }
+    }
+
+    public static bool IsConnected(h: int) {
+        var ok: bool = false
+        @c { ok = _mb_is_connected(h) != 0; }
+        return ok
+    }
+
+    // Text of the last error on this handle ("" after a success).
+    public static string LastError(h: int) {
+        var s: string = ""
+        @c { s = _mb_last_error(h); }
+        return s
+    }
+
+    // FC01 — coils. Returns the count read, or < 0 (see the header).
+    public static int ReadCoils(h: int, unit: int, addr: int, count: int) {
+        var n: int = 0
+        @c { n = _mb_read(h, unit, 1, addr, count); }
+        return n
+    }
+
+    // FC02 — discrete inputs.
+    public static int ReadDiscreteInputs(h: int, unit: int, addr: int, count: int) {
+        var n: int = 0
+        @c { n = _mb_read(h, unit, 2, addr, count); }
+        return n
+    }
+
+    // FC03 — holding registers.
+    public static int ReadHolding(h: int, unit: int, addr: int, count: int) {
+        var n: int = 0
+        @c { n = _mb_read(h, unit, 3, addr, count); }
+        return n
+    }
+
+    // FC04 — input registers.
+    public static int ReadInput(h: int, unit: int, addr: int, count: int) {
+        var n: int = 0
+        @c { n = _mb_read(h, unit, 4, addr, count); }
+        return n
+    }
+
+    // FC05 — one coil.
+    public static int WriteCoil(h: int, unit: int, addr: int, on: bool) {
+        var n: int = 0
+        @c { n = _mb_write_single(h, unit, 5, addr, on ? 1 : 0); }
+        return n
+    }
+
+    // FC06 — one holding register (0..65535, or -32768..-1 as int16).
+    public static int WriteRegister(h: int, unit: int, addr: int, value: int) {
+        var n: int = 0
+        @c { n = _mb_write_single(h, unit, 6, addr, value); }
+        return n
+    }
+
+    // FC16 — several holding registers, as "v0,v1,...".
+    public static int WriteRegisters(h: int, unit: int, addr: int, values: string) {
+        var n: int = -4
+        @c {
+            uint16_t regs[123];
+            int cnt = _mb_parse_list((const char*) values, regs, 123);
+            n = cnt > 0 ? _mb_write_regs(h, unit, addr, regs, cnt) : -4;
+        }
+        return n
+    }
+
+    // FC16 — a float32 over two registers.
+    public static int WriteFloat32(h: int, unit: int, addr: int, value: float, wordSwap: bool) {
+        var n: int = 0
+        @c {
+            uint16_t regs[2];
+            _mb_split32(_mb_f2u(value), regs, wordSwap ? 1 : 0);
+            n = _mb_write_regs(h, unit, addr, regs, 2);
+        }
+        return n
+    }
+
+    // FC16 — an int32 over two registers.
+    public static int WriteInt32(h: int, unit: int, addr: int, value: int, wordSwap: bool) {
+        var n: int = 0
+        @c {
+            uint16_t regs[2];
+            _mb_split32((uint32_t) (int32_t) value, regs, wordSwap ? 1 : 0);
+            n = _mb_write_regs(h, unit, addr, regs, 2);
+        }
+        return n
+    }
+
+    // ── Values of the last read on this handle ───────────────────
+    // `i` is relative to the first address read.
+
+    // Register as uint16 (0..65535), or bit as 0 / 1.
+    public static int Value(h: int, i: int) {
+        var v: int = 0
+        @c { v = _mb_value(h, i); }
+        return v
+    }
+
+    public static int Int16(h: int, i: int) {
+        var v: int = 0
+        @c { v = (int16_t) (uint16_t) _mb_value(h, i); }
+        return v
+    }
+
+    // Registers i and i+1. wordSwap = false : high word first (ABCD).
+    public static int UInt32(h: int, i: int, wordSwap: bool) {
+        var v: int = 0
+        @c { v = (int64_t) _mb_value32(h, i, wordSwap ? 1 : 0); }
+        return v
+    }
+
+    public static int Int32(h: int, i: int, wordSwap: bool) {
+        var v: int = 0
+        @c { v = (int32_t) _mb_value32(h, i, wordSwap ? 1 : 0); }
+        return v
+    }
+
+    public static float Float32(h: int, i: int, wordSwap: bool) {
+        var f: float = 0.0
+        @c { f = _mb_u2f(_mb_value32(h, i, wordSwap ? 1 : 0)); }
+        return f
+    }
+
+    // ── Server (PLC simulator, one per process) ──────────────────
+    // Tables : 1 coils, 2 discrete inputs, 3 holding, 4 input registers.
+
+    // Listen on host:port in a background thread. "127.0.0.1" stays
+    // local ; "0.0.0.0" listens on every interface.
+    public static bool ServerStart(host: string, port: int) {
+        var ok: bool = false
+        @c { ok = _mbs_start((const char*) host, port) != 0; }
+        return ok
+    }
+
+    // Addresses >= size answer "illegal data address" (default 65536).
+    public static void ServerSetSize(size: int) {
+        @c { if (size >= 1 && size <= 65536) _mbs_size = (int) size; }
+    }
+
+    public static void ServerSetCoil(addr: int, on: bool) {
+        @c { _mbs_set(1, addr, on ? 1 : 0); }
+    }
+
+    public static void ServerSetDiscrete(addr: int, on: bool) {
+        @c { _mbs_set(2, addr, on ? 1 : 0); }
+    }
+
+    public static void ServerSetHolding(addr: int, value: int) {
+        @c { _mbs_set(3, addr, value); }
+    }
+
+    public static void ServerSetInput(addr: int, value: int) {
+        @c { _mbs_set(4, addr, value); }
+    }
+
+    // table 3 or 4 ; two registers from addr.
+    public static void ServerSetFloat32(table: int, addr: int, value: float, wordSwap: bool) {
+        @c { _mbs_set32((int) table, addr, _mb_f2u(value), wordSwap ? 1 : 0); }
+    }
+
+    public static void ServerSetInt32(table: int, addr: int, value: int, wordSwap: bool) {
+        @c { _mbs_set32((int) table, addr, (uint32_t) (int32_t) value, wordSwap ? 1 : 0); }
+    }
+
+    public static bool ServerGetCoil(addr: int) {
+        var on: bool = false
+        @c { on = _mbs_get(1, addr) != 0; }
+        return on
+    }
+
+    public static int ServerGetHolding(addr: int) {
+        var v: int = 0
+        @c { v = _mbs_get(3, addr); }
+        return v
+    }
+
+    // Requests served since start (all clients).
+    public static int ServerRequestCount() {
+        var n: int = 0
+        @c { n = _mbs_requests; }
+        return n
+    }
+}
