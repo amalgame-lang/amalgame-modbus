@@ -1,0 +1,64 @@
+# Package manifest — amalgame-modbus
+#
+# Modbus TCP for Amalgame : a client (function codes 01 02 03 04
+# 05 06 15 16, timeouts, exceptions, reconnect, int16 / int32 /
+# uint32 / float32 decoding with or without word swap) and a
+# Modbus TCP server meant as a PLC simulator for tests and demos.
+#
+# Written for Kairo Edge (SCADA) but has no Kairo dependency.
+# Pure C over BSD sockets / Winsock, no libmodbus.
+
+[package]
+name              = "amalgame-modbus"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Modbus TCP client and PLC simulator for Amalgame — Linux, macOS, Windows."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.8.52"
+schema-version    = 1
+
+[stdlib]
+class     = "Modbus"
+header    = "runtime/Amalgame_Modbus.h"
+namespace = "Amalgame.Modbus"
+facade    = "facade.am"
+
+# pthread for the per-connection mutex and the simulator threads.
+# Winsock is loaded at runtime on Windows (see facade.am).
+libs      = ["pthread"]
+
+[stdlib.functions]
+# Client
+Connect             = { returns = "i64" }
+Close               = { returns = "void" }
+IsConnected         = { returns = "code_bool" }
+LastError           = { returns = "code_string" }
+ReadCoils           = { returns = "i64" }
+ReadDiscreteInputs  = { returns = "i64" }
+ReadHolding         = { returns = "i64" }
+ReadInput           = { returns = "i64" }
+WriteCoil           = { returns = "i64" }
+WriteRegister       = { returns = "i64" }
+WriteRegisters      = { returns = "i64" }
+WriteFloat32        = { returns = "i64" }
+WriteInt32          = { returns = "i64" }
+
+# Values of the last read
+Value               = { returns = "i64" }
+Int16               = { returns = "i64" }
+UInt32              = { returns = "i64" }
+Int32               = { returns = "i64" }
+Float32             = { returns = "double" }
+
+# Server (PLC simulator)
+ServerStart         = { returns = "code_bool" }
+ServerSetSize       = { returns = "void" }
+ServerSetCoil       = { returns = "void" }
+ServerSetDiscrete   = { returns = "void" }
+ServerSetHolding    = { returns = "void" }
+ServerSetInput      = { returns = "void" }
+ServerSetFloat32    = { returns = "void" }
+ServerSetInt32      = { returns = "void" }
+ServerGetCoil       = { returns = "code_bool" }
+ServerGetHolding    = { returns = "i64" }
+ServerRequestCount  = { returns = "i64" }

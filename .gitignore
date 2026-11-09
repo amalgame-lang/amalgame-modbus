@@ -1,0 +1,5 @@
+# Package archive built by CI / amc package add
+/build/
+
+# Created by amc when a package command runs in this folder
+/amalgame.lock

@@ -1,0 +1,43 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Oldest amc the package supports (required-amalgame in
+        # amalgame.toml) and the current one.
+        amc-tag: [v0.8.52, v0.8.90]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: sudo apt-get install -y libgc-dev
+
+      - name: Download amc
+        run: |
+          TAG="${{ matrix.amc-tag }}"
+          VERSION="${TAG#v}"
+          curl -sSL -o amc.tar.gz \
+            "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
+          mkdir -p $RUNNER_TEMP/amc-install
+          tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+
+      - name: Build package archive
+        run: |
+          "$AMC" --lib --quiet facade.am -o /tmp/Modbus-facade
+          gcc -O2 -Wall -I"$RUNNER_TEMP/amc-install/share/amalgame/runtime" \
+              -I"./runtime" -c /tmp/Modbus-facade.c -o /tmp/Modbus-facade.o
+          mkdir -p build/linux-x86_64
+          ar rcs build/linux-x86_64/libamalgame-pkg-Modbus.a /tmp/Modbus-facade.o
+
+      - name: Run Amalgame smoke tests
+        run: bash ./tests/run_am_tests.sh "$AMC"
